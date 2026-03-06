@@ -47,7 +47,7 @@ async def backfill_candles(client: IndexerClient):
     logger.info("Starting historical backfill of candles...")
 
     end_dt = datetime.now(timezone.utc)
-    start_boundary = end_dt - timedelta(days=365)
+    start_boundary = end_dt - timedelta(days=545)
 
     all_candles = []
     current_to = end_dt
