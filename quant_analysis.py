@@ -1,22 +1,19 @@
 # ============================================================
-# BTC PERPS INSTITUTIONAL RESEARCH STACK - REVISED
+# BTC PERPS QUANT ANALYSIS - FUNDING-AWARE VERSION
 # ------------------------------------------------------------
-# Upgrades in this version:
-# - fixed-risk backtesting by default
-# - optional probability-weighted sizing
-# - threshold sweep utilities
-# - top-N per day / week selection
-# - transition-only / regime filtering
-# - tighter candidate generation
-# - safer feature importance / SHAP handling
-# - walk-forward event scoring with usable window sizes
+# Designed for merged candle + funding feature parquet
+# Includes:
+# - funding-aware feature pipeline
+# - walk-forward modeling
+# - threshold sweep
+# - slippage sensitivity testing for selected thresholds
 # ============================================================
 
 from __future__ import annotations
 
 import math
 import warnings
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 from typing import Any, Iterable
 
 import numpy as np
@@ -62,7 +59,8 @@ except Exception:
 
 @dataclass
 class DataConfig:
-    input_file: str = "./data/historical/BTC-USD_candles_2026-03-06.parquet"
+    # point this at your merged feature table from the ingestion script
+    input_file: str = "./data/features/BTC-USD_feature_table_2026-03-06.parquet"
 
 
 @dataclass
@@ -80,11 +78,9 @@ class FeatureConfig:
     sweep_atr_mult: float = 1.2
     pivot_cooldown: int = 8
 
-    # tighter candidate generation
     zscore_event_threshold: float = 1.5
     dist_ema_event_threshold: float = 0.004
     min_adx_for_event: float = 18.0
-    min_vol_spike_for_transition: float = 1.2
 
 
 @dataclass
@@ -98,7 +94,7 @@ class LabelConfig:
 class ModelConfig:
     model_family: str = "auto"   # auto | xgb | lgbm | rf
     random_state: int = 42
-    prob_threshold: float = 0.62
+    prob_threshold: float = 0.56
     top_k_list: tuple[int, ...] = (10, 20, 50, 100)
     min_train_events: int = 300
     min_test_events: int = 50
@@ -130,7 +126,6 @@ class BacktestConfig:
     bars_per_year: int = 288 * 365
     min_entry_gap_bars: int = 3
 
-    # backtest policy
     position_sizing_mode: str = "fixed"   # fixed | prob_weighted
     selection_mode: str = "threshold"     # threshold | top_n_per_day | top_n_per_week
     top_n: int = 2
@@ -158,12 +153,16 @@ def load_data(path: str) -> pd.DataFrame:
     if "startedAt" not in df.columns:
         raise ValueError("Expected 'startedAt' column in parquet.")
 
-    df["startedAt"] = pd.to_datetime(df["startedAt"])
+    df["startedAt"] = pd.to_datetime(df["startedAt"], utc=True, errors="coerce")
 
     numeric_cols = [
         "open", "high", "low", "close",
         "baseTokenVolume", "usdVolume", "trades",
-        "startingOpenInterest", "fundingRate",
+        "startingOpenInterest",
+        "orderbookMidPriceOpen", "orderbookMidPriceClose",
+        "fundingRate", "fundingRateAbs", "fundingRateDiff", "fundingRateZ96",
+        "fundingPositive", "fundingNegative",
+        "oiDelta", "oiPctChange", "midPriceReturn",
     ]
     for col in numeric_cols:
         if col in df.columns:
@@ -175,7 +174,7 @@ def load_data(path: str) -> pd.DataFrame:
         raise ValueError(f"Missing required OHLC columns: {missing}")
 
     df = df.sort_values("startedAt").reset_index(drop=True)
-    df = df.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
+    df = df.dropna(subset=["startedAt", "open", "high", "low", "close"]).reset_index(drop=True)
     return df
 
 
@@ -316,16 +315,43 @@ def build_quant_features(df: pd.DataFrame, cfg: FeatureConfig) -> pd.DataFrame:
         for col in fill_cols:
             df[col] = np.nan
 
-    # funding
+    # funding features from merged table
     if "fundingRate" in df.columns:
-        df["funding_z"] = rolling_z(df["fundingRate"], cfg.funding_window)
-        df["funding_abs"] = df["fundingRate"].abs()
-        df["funding_oi_interact"] = df["fundingRate"] * df["oi_norm"]
+        df["fundingRate"] = pd.to_numeric(df["fundingRate"], errors="coerce")
     else:
         df["fundingRate"] = np.nan
-        df["funding_z"] = np.nan
-        df["funding_abs"] = np.nan
-        df["funding_oi_interact"] = np.nan
+
+    if "fundingRateAbs" not in df.columns:
+        df["fundingRateAbs"] = df["fundingRate"].abs()
+
+    if "fundingRateDiff" not in df.columns:
+        df["fundingRateDiff"] = df["fundingRate"].diff()
+
+    if "fundingRateZ96" not in df.columns:
+        df["fundingRateZ96"] = rolling_z(df["fundingRate"], cfg.funding_window)
+
+    if "fundingPositive" not in df.columns:
+        df["fundingPositive"] = (df["fundingRate"] > 0).astype(float)
+
+    if "fundingNegative" not in df.columns:
+        df["fundingNegative"] = (df["fundingRate"] < 0).astype(float)
+
+    # derived funding interactions
+    df["funding_oi_interact"] = df["fundingRate"] * df["oi_norm"]
+    df["funding_ret_interact"] = df["fundingRate"] * df["ret_3"]
+    df["funding_abs_oi"] = df["fundingRateAbs"] * df["oi_norm"]
+
+    # optional extra merged fields from ingestion
+    if "oiDelta" in df.columns and "oi_delta" not in df.columns:
+        df["oi_delta"] = pd.to_numeric(df["oiDelta"], errors="coerce")
+
+    if "oiPctChange" in df.columns and "oi_ret" not in df.columns:
+        df["oi_ret"] = pd.to_numeric(df["oiPctChange"], errors="coerce")
+
+    if "midPriceReturn" in df.columns:
+        df["midPriceReturn"] = pd.to_numeric(df["midPriceReturn"], errors="coerce")
+    else:
+        df["midPriceReturn"] = np.nan
 
     # liquidation / impulse proxies
     df["down_impulse"] = (
@@ -350,6 +376,17 @@ def build_quant_features(df: pd.DataFrame, cfg: FeatureConfig) -> pd.DataFrame:
         (df["ret_1"] > 0) &
         (df["oi_delta"] < 0) &
         (df["vol_spike"] > 1.2)
+    ).astype(int)
+
+    # funding-driven crowding proxies
+    df["crowded_long_funding"] = (
+        (df["fundingRate"] > 0) &
+        (df["oi_delta"] > 0)
+    ).astype(int)
+
+    df["crowded_short_funding"] = (
+        (df["fundingRate"] < 0) &
+        (df["oi_delta"] > 0)
     ).astype(int)
 
     # session / time
@@ -379,29 +416,6 @@ def build_quant_features(df: pd.DataFrame, cfg: FeatureConfig) -> pd.DataFrame:
     rolling_low_20 = df["low"].shift(1).rolling(20).min()
     df["dist_prev20_high"] = (df["close"] - rolling_high_20) / df["close"]
     df["dist_prev20_low"] = (df["close"] - rolling_low_20) / df["close"]
-
-    # defaults
-    required_defaults = {
-        "zscore_close": np.nan,
-        "vol_spike": np.nan,
-        "usdVolume_z": np.nan,
-        "trades_z": np.nan,
-        "trades_spike": np.nan,
-        "oi_delta": np.nan,
-        "oi_ret": np.nan,
-        "oi_z": np.nan,
-        "oi_delta_z": np.nan,
-        "oi_norm": np.nan,
-        "fundingRate": np.nan,
-        "funding_z": np.nan,
-        "funding_abs": np.nan,
-        "funding_oi_interact": np.nan,
-        "flush_proxy": 0,
-        "squeeze_proxy": 0,
-    }
-    for col, default_val in required_defaults.items():
-        if col not in df.columns:
-            df[col] = default_val
 
     return df
 
@@ -545,7 +559,7 @@ def detect_secondary_timing_features(df: pd.DataFrame, cfg: FeatureConfig) -> pd
 
 
 # ============================================================
-# BROAD EVENT GENERATION - TIGHTENED
+# BROAD EVENT GENERATION
 # ============================================================
 
 def build_candidate_events(df: pd.DataFrame) -> pd.DataFrame:
@@ -557,7 +571,6 @@ def build_candidate_events(df: pd.DataFrame) -> pd.DataFrame:
     dthr = FEAT_CFG.dist_ema_event_threshold
     adx_thr = FEAT_CFG.min_adx_for_event
 
-    # stricter: regime-aligned only, no transition in base candidates
     long_cond = (
         (df["regime"] == "uptrend") &
         (df["adx"] > adx_thr) &
@@ -666,15 +679,18 @@ def get_feature_columns() -> list[str]:
         "price_oi_interact_1", "price_oi_interact_3",
         "long_crowded_proxy", "short_crowded_proxy",
         "long_unwind_proxy", "short_unwind_proxy",
-        "fundingRate", "funding_z", "funding_abs", "funding_oi_interact",
+        "fundingRate", "fundingRateAbs", "fundingRateDiff", "fundingRateZ96",
+        "fundingPositive", "fundingNegative",
+        "funding_oi_interact", "funding_ret_interact", "funding_abs_oi",
         "down_impulse", "up_impulse", "flush_proxy", "squeeze_proxy",
+        "crowded_long_funding", "crowded_short_funding",
         "hour_sin", "hour_cos", "dow_sin", "dow_cos",
         "session_asia", "session_europe", "session_us", "is_weekend",
         "sweep_high", "sweep_low", "sweep_size_atr", "pivot_age_bars", "is_sweep_event",
         "range_6", "range_24", "range_ratio",
         "dist_prev20_high", "dist_prev20_low",
         "high_break_20", "low_break_20",
-        "regime_uptrend", "regime_downtrend", "regime_transition",
+        "midPriceReturn",
     ]
 
 
@@ -805,11 +821,24 @@ def build_model(model_family: str, random_state: int):
 
 
 # ============================================================
+# FEATURE FILTERING
+# ============================================================
+
+def get_live_feature_cols(events_side: pd.DataFrame) -> tuple[list[str], list[str]]:
+    feature_cols = list(dict.fromkeys(get_feature_columns()))
+    feature_cols = [c for c in feature_cols if c in events_side.columns]
+
+    constant_cols = [c for c in feature_cols if events_side[c].nunique(dropna=False) <= 1]
+    live_cols = [c for c in feature_cols if c not in constant_cols]
+    return live_cols, constant_cols
+
+
+# ============================================================
 # CV + TRAINING
 # ============================================================
 
 def cross_validate_side_model(events_side: pd.DataFrame, model_family: str) -> pd.DataFrame:
-    feature_cols = list(dict.fromkeys(get_feature_columns()))
+    feature_cols, _ = get_live_feature_cols(events_side)
     events_side = events_side.sort_values("startedAt").reset_index(drop=True)
 
     X = events_side[feature_cols]
@@ -859,12 +888,7 @@ def fit_side_model(events_side: pd.DataFrame, side_name: str) -> dict[str, Any]:
         raise ValueError(f"Not enough {side_name} events to train: {len(events_side)}")
 
     events_side = events_side.sort_values("startedAt").reset_index(drop=True)
-    feature_cols = list(dict.fromkeys(get_feature_columns()))
-    feature_cols = [c for c in feature_cols if events_side[c].nunique(dropna=False) > 1]
-
-    missing_cols = [c for c in feature_cols if c not in events_side.columns]
-    if missing_cols:
-        raise ValueError(f"Missing feature columns for {side_name}: {missing_cols}")
+    feature_cols, constant_cols = get_live_feature_cols(events_side)
 
     n = len(events_side)
     train_end = int(n * 0.60)
@@ -914,32 +938,15 @@ def fit_side_model(events_side: pd.DataFrame, side_name: str) -> dict[str, Any]:
                 best_metric = metric
                 best_threshold = float(th)
 
-    # constant cols info
-    constant_cols = [c for c in feature_cols if events_side[c].nunique(dropna=False) <= 1]
-
-    # robust feature importance
     feat_imp = pd.DataFrame(columns=["feature", "importance"])
     if hasattr(model, "feature_importances_"):
         importances = np.asarray(model.feature_importances_).ravel()
-        if len(importances) != len(feature_cols):
-            print(
-                f"\n[WARN] {side_name} feature importance length mismatch: "
-                f"{len(importances)} importances vs {len(feature_cols)} feature columns"
-            )
-            min_len = min(len(importances), len(feature_cols))
-            feat_imp = pd.DataFrame(
-                {
-                    "feature": feature_cols[:min_len],
-                    "importance": importances[:min_len],
-                }
-            ).sort_values("importance", ascending=False)
-        else:
-            feat_imp = pd.DataFrame(
-                {
-                    "feature": feature_cols,
-                    "importance": importances,
-                }
-            ).sort_values("importance", ascending=False)
+        feat_imp = pd.DataFrame(
+            {
+                "feature": feature_cols[: len(importances)],
+                "importance": importances,
+            }
+        ).sort_values("importance", ascending=False)
 
     shap_df = None
     if HAS_SHAP and len(test) > 0:
@@ -958,15 +965,13 @@ def fit_side_model(events_side: pd.DataFrame, side_name: str) -> dict[str, Any]:
                 shap_values = shap_values[:, :, 1]
 
             mean_abs = np.abs(shap_values).mean(axis=0)
-            min_len = min(len(mean_abs), len(feature_cols))
             shap_df = pd.DataFrame(
                 {
-                    "feature": feature_cols[:min_len],
-                    "mean_abs_shap": mean_abs[:min_len],
+                    "feature": feature_cols[: len(mean_abs)],
+                    "mean_abs_shap": mean_abs,
                 }
             ).sort_values("mean_abs_shap", ascending=False)
-        except Exception as e:
-            print(f"\n[WARN] SHAP failed for {side_name}: {e}")
+        except Exception:
             shap_df = None
 
     cv_df = cross_validate_side_model(events_side, MODEL_CFG.model_family)
@@ -1091,34 +1096,12 @@ def cumulative_return_by_ranked_probability(events_df: pd.DataFrame, prob_col: s
     return tmp[["rank", prob_col, "realized_r", "cum_realized_r", "cum_hit_rate", "target_hit"]]
 
 
-def print_prob_diagnostics(title: str, scored_test: pd.DataFrame) -> None:
-    print(f"\n=== {title}: PROBABILITY DECILES ===")
-    dec = probability_decile_table(scored_test)
-    print(dec.to_string(index=False) if not dec.empty else "No decile data.")
-
-    print(f"\n=== {title}: PRECISION AT TOP-K ===")
-    pak = precision_at_top_k(scored_test, MODEL_CFG.top_k_list)
-    print(pak.to_string(index=False) if not pak.empty else "No top-k data.")
-
-    print(f"\n=== {title}: CUMULATIVE RETURN BY RANKED PROBABILITY (HEAD) ===")
-    cum = cumulative_return_by_ranked_probability(scored_test)
-    print(cum.head(20).to_string(index=False) if not cum.empty else "No cumulative data.")
-
-
 # ============================================================
 # WALK-FORWARD TRAINING
 # ============================================================
 
-def score_side_events(model_info: dict[str, Any], events_side: pd.DataFrame) -> pd.DataFrame:
-    scored = events_side.copy()
-    X = scored[model_info["feature_cols"]]
-    X_imp = model_info["imputer"].transform(X)
-    scored["pred_prob"] = model_info["model"].predict_proba(X_imp)[:, 1]
-    return scored
-
-
 def train_side_on_window(events_side_train: pd.DataFrame) -> tuple[Any, Any, list[str]]:
-    feature_cols = list(dict.fromkeys(get_feature_columns()))
+    feature_cols, _ = get_live_feature_cols(events_side_train)
     X = events_side_train[feature_cols]
     y = events_side_train["target_hit"].astype(int)
     imp = SimpleImputer(strategy="median")
@@ -1199,22 +1182,23 @@ def choose_risk_fraction(prob: float, cfg: BacktestConfig) -> float:
     return cfg.base_risk_fraction
 
 
-def filter_scored_events_for_backtest(scored_events: pd.DataFrame, cfg: BacktestConfig, prob_threshold: float) -> pd.DataFrame:
+def filter_scored_events_for_backtest(
+    scored_events: pd.DataFrame,
+    cfg: BacktestConfig,
+    prob_threshold: float
+) -> pd.DataFrame:
     ev = scored_events.copy()
 
     if ev.empty:
         return ev
 
-    # threshold selection
     ev = ev[ev["pred_prob"] >= prob_threshold].copy()
 
-    # side selection
     if not cfg.allow_long:
         ev = ev[ev["side"] != "long"]
     if not cfg.allow_short:
         ev = ev[ev["side"] != "short"]
 
-    # regime filter
     if cfg.regime_filter_mode == "transition_only":
         ev = ev[ev["entry_regime"] == "transition"]
     elif cfg.regime_filter_mode == "non_transition":
@@ -1222,30 +1206,24 @@ def filter_scored_events_for_backtest(scored_events: pd.DataFrame, cfg: Backtest
     elif cfg.regime_filter_mode == "trend_only":
         ev = ev[ev["entry_regime"].isin(["uptrend", "downtrend"])]
 
-    ev = ev[
-        ((ev["side"] == "short") & (ev["entry_regime"] == "downtrend")) |
-        ((ev["side"] == "long") & (ev["entry_regime"] == "uptrend"))
-    ]
-
     if ev.empty:
         return ev
 
-    # selection mode
     if cfg.selection_mode == "top_n_per_day":
         ev["bucket"] = pd.to_datetime(ev["startedAt"]).dt.floor("D")
         ev = (
             ev.sort_values(["bucket", "pred_prob"], ascending=[True, False])
-              .groupby("bucket", group_keys=False)
-              .head(cfg.top_n)
-              .drop(columns=["bucket"])
+            .groupby("bucket", group_keys=False)
+            .head(cfg.top_n)
+            .drop(columns=["bucket"])
         )
     elif cfg.selection_mode == "top_n_per_week":
         ev["bucket"] = pd.to_datetime(ev["startedAt"]).dt.to_period("W").astype(str)
         ev = (
             ev.sort_values(["bucket", "pred_prob"], ascending=[True, False])
-              .groupby("bucket", group_keys=False)
-              .head(cfg.top_n)
-              .drop(columns=["bucket"])
+            .groupby("bucket", group_keys=False)
+            .head(cfg.top_n)
+            .drop(columns=["bucket"])
         )
 
     return ev.sort_values("startedAt").reset_index(drop=True)
@@ -1528,7 +1506,7 @@ def threshold_sweep(
 ) -> pd.DataFrame:
     rows = []
     for th in thresholds:
-        res, trades, _ = backtest_scored_events(df, scored_events, th, bt_cfg, label_cfg)
+        res, _, _ = backtest_scored_events(df, scored_events, th, bt_cfg, label_cfg)
         rows.append({
             "threshold": th,
             "total_trades": res["total_trades"],
@@ -1540,6 +1518,42 @@ def threshold_sweep(
             "avg_pnl_per_trade": res["avg_pnl_per_trade"],
             "max_drawdown_pct": res["max_drawdown_pct"],
         })
+    return pd.DataFrame(rows)
+
+
+def slippage_sensitivity_test(
+    df: pd.DataFrame,
+    scored_events: pd.DataFrame,
+    thresholds: list[float],
+    slippage_levels: list[float],
+    bt_cfg: BacktestConfig,
+    label_cfg: LabelConfig,
+) -> pd.DataFrame:
+    rows = []
+
+    for th in thresholds:
+        for slip in slippage_levels:
+            bt_cfg_test = replace(bt_cfg, slippage_bps=slip)
+            res, _, _ = backtest_scored_events(
+                df=df,
+                scored_events=scored_events,
+                prob_threshold=th,
+                bt_cfg=bt_cfg_test,
+                label_cfg=label_cfg,
+            )
+            rows.append({
+                "threshold": th,
+                "slippage_bps": slip,
+                "total_trades": res["total_trades"],
+                "final_capital": res["final_capital"],
+                "net_profit": res["net_profit"],
+                "total_return_pct": res["total_return_pct"],
+                "profit_factor": res["profit_factor"],
+                "win_rate_pct": res["win_rate_pct"],
+                "avg_pnl_per_trade": res["avg_pnl_per_trade"],
+                "max_drawdown_pct": res["max_drawdown_pct"],
+            })
+
     return pd.DataFrame(rows)
 
 
@@ -1587,7 +1601,6 @@ def main():
     print("WalkForward:", asdict(WF_CFG))
     print("Backtest:", asdict(BT_CFG))
 
-    # 1) pipeline
     df = load_data(DATA_CFG.input_file)
     df = run_pipeline(df)
 
@@ -1597,7 +1610,9 @@ def main():
     print("sweep_high:", int(df["sweep_high"].sum()))
     print("sweep_low:", int(df["sweep_low"].sum()))
 
-    # 2) events
+    if "fundingRate" in df.columns:
+        print("funding non-null rows:", int(df["fundingRate"].notna().sum()))
+
     events = build_event_dataset(df)
     long_events = events[events["side"] == "long"].copy()
     short_events = events[events["side"] == "short"].copy()
@@ -1609,7 +1624,6 @@ def main():
     if len(events) > 0:
         print("Sweep event share:", f"{events['is_sweep_event'].mean() * 100:.2f}%")
 
-    # 3) side models
     long_model_info = None
     short_model_info = None
 
@@ -1621,7 +1635,6 @@ def main():
         short_model_info = fit_side_model(short_events, "short")
         print_model_summary(short_model_info)
 
-    # 4) holdout diagnostics
     long_test_scored = attach_pred_probs(long_model_info) if long_model_info is not None else pd.DataFrame()
     short_test_scored = attach_pred_probs(short_model_info) if short_model_info is not None else pd.DataFrame()
 
@@ -1632,10 +1645,6 @@ def main():
         print(precision_at_top_k(long_test_scored, MODEL_CFG.top_k_list).to_string(index=False))
         print("\n=== LONG TEST SET: CUMULATIVE RETURN BY RANKED PROBABILITY (HEAD) ===")
         print(cumulative_return_by_ranked_probability(long_test_scored).head(20).to_string(index=False))
-        plot_cumulative_ranked_probability(
-            cumulative_return_by_ranked_probability(long_test_scored),
-            "Long Test Set: Cumulative R by Ranked Probability",
-        )
 
     if not short_test_scored.empty:
         print("\n=== SHORT TEST SET: PROBABILITY DECILES ===")
@@ -1644,12 +1653,7 @@ def main():
         print(precision_at_top_k(short_test_scored, MODEL_CFG.top_k_list).to_string(index=False))
         print("\n=== SHORT TEST SET: CUMULATIVE RETURN BY RANKED PROBABILITY (HEAD) ===")
         print(cumulative_return_by_ranked_probability(short_test_scored).head(20).to_string(index=False))
-        plot_cumulative_ranked_probability(
-            cumulative_return_by_ranked_probability(short_test_scored),
-            "Short Test Set: Cumulative R by Ranked Probability",
-        )
 
-    # 5) walk-forward scoring
     wf_long = walk_forward_score_events(long_events) if len(long_events) >= WF_CFG.min_events_per_side else pd.DataFrame()
     wf_short = walk_forward_score_events(short_events) if len(short_events) >= WF_CFG.min_events_per_side else pd.DataFrame()
     wf_scored = pd.concat([wf_long, wf_short], ignore_index=True).sort_values("startedAt").reset_index(drop=True)
@@ -1662,7 +1666,6 @@ def main():
         print("\nWF precision at top-k:")
         print(precision_at_top_k(wf_scored, MODEL_CFG.top_k_list).to_string(index=False))
 
-    # 6) primary backtest using current config
     wf_results, wf_trades, wf_equity = backtest_scored_events(
         df=df,
         scored_events=wf_scored,
@@ -1704,71 +1707,34 @@ def main():
 
     plot_equity_curve(wf_equity, "Walk-Forward ML Equity Curve")
 
-    # 7) threshold sweep - fixed risk, all regimes
-    print("\n=== THRESHOLD SWEEP: FIXED RISK / ALL REGIMES ===")
-    base_sweep_cfg = BacktestConfig(**asdict(BT_CFG))
-    base_sweep_cfg.position_sizing_mode = "fixed"
-    base_sweep_cfg.regime_filter_mode = "all"
-    base_sweep_cfg.selection_mode = "threshold"
-
+    print("\n=== THRESHOLD SWEEP ===")
     sweep_df = threshold_sweep(
         df=df,
         scored_events=wf_scored,
-        thresholds=[0.56, 0.58, 0.60, 0.62, 0.64, 0.66],
-        bt_cfg=base_sweep_cfg,
+        thresholds=[0.52, 0.54, 0.56, 0.58, 0.60, 0.62, 0.64],
+        bt_cfg=BT_CFG,
         label_cfg=LABEL_CFG,
     )
     print(sweep_df.to_string(index=False))
 
-    # 8) threshold sweep - fixed risk, transition only
-    print("\n=== THRESHOLD SWEEP: FIXED RISK / TRANSITION ONLY ===")
-    trans_cfg = BacktestConfig(**asdict(BT_CFG))
-    trans_cfg.position_sizing_mode = "fixed"
-    trans_cfg.regime_filter_mode = "transition_only"
-    trans_cfg.selection_mode = "threshold"
-
-    trans_sweep_df = threshold_sweep(
+    print("\n=== SLIPPAGE SENSITIVITY TEST ===")
+    slippage_df = slippage_sensitivity_test(
         df=df,
         scored_events=wf_scored,
-        thresholds=[0.56, 0.58, 0.60, 0.62, 0.64, 0.66],
-        bt_cfg=trans_cfg,
+        thresholds=[0.52, 0.58, 0.64],
+        slippage_levels=[0.0, 0.5, 1.0, 1.5, 2.0],
+        bt_cfg=BT_CFG,
         label_cfg=LABEL_CFG,
     )
-    print(trans_sweep_df.to_string(index=False))
+    print(slippage_df.to_string(index=False))
 
-    # 9) top-N per day - fixed risk
-    print("\n=== TOP-N PER DAY BACKTEST (FIXED RISK, ALL REGIMES) ===")
-    topn_cfg = BacktestConfig(**asdict(BT_CFG))
-    topn_cfg.position_sizing_mode = "fixed"
-    topn_cfg.selection_mode = "top_n_per_day"
-    topn_cfg.top_n = 2
-    topn_cfg.regime_filter_mode = "all"
+    print("\n=== RETURN % BY SLIPPAGE ===")
+    slippage_pivot = slippage_df.pivot(index="slippage_bps", columns="threshold", values="total_return_pct")
+    print(slippage_pivot.round(4).to_string())
 
-    topn_results, topn_trades, topn_equity = backtest_scored_events(
-        df=df,
-        scored_events=wf_scored,
-        prob_threshold=0.60,
-        bt_cfg=topn_cfg,
-        label_cfg=LABEL_CFG,
-    )
-    print_backtest_results(topn_results, "TOP-N PER DAY BACKTEST")
-
-    # 10) top-N per day - transition only
-    print("\n=== TOP-N PER DAY BACKTEST (FIXED RISK, TRANSITION ONLY) ===")
-    topn_trans_cfg = BacktestConfig(**asdict(BT_CFG))
-    topn_trans_cfg.position_sizing_mode = "fixed"
-    topn_trans_cfg.selection_mode = "top_n_per_day"
-    topn_trans_cfg.top_n = 2
-    topn_trans_cfg.regime_filter_mode = "transition_only"
-
-    topn_trans_results, topn_trans_trades, topn_trans_equity = backtest_scored_events(
-        df=df,
-        scored_events=wf_scored,
-        prob_threshold=0.60,
-        bt_cfg=topn_trans_cfg,
-        label_cfg=LABEL_CFG,
-    )
-    print_backtest_results(topn_trans_results, "TOP-N PER DAY / TRANSITION ONLY BACKTEST")
+    print("\n=== PROFIT FACTOR BY SLIPPAGE ===")
+    pf_pivot = slippage_df.pivot(index="slippage_bps", columns="threshold", values="profit_factor")
+    print(pf_pivot.round(4).to_string())
 
 
 if __name__ == "__main__":
